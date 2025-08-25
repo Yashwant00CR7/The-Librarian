@@ -14,9 +14,9 @@ COPY --chown=appuser:appuser requirements.txt .
 # Install the Python dependencies
 RUN pip install --no-cache-dir --upgrade -r requirements.txt
 
-# CRITICAL STEP: Install the browser binaries needed by Crawl4ai/Playwright
-# The --with-deps flag also installs necessary system libraries.
-RUN python -m playwright install --with-deps chromium
+# CRITICAL STEP (CORRECTED): Use the official Crawl4ai setup command
+# This handles the installation of Playwright and its browser dependencies.
+RUN crawl4ai-setup
 
 # Copy the rest of your application code into the container
 COPY --chown=appuser:appuser . .
