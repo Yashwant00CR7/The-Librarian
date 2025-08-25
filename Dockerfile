@@ -14,9 +14,9 @@ COPY --chown=appuser:appuser requirements.txt .
 # Install the Python dependencies
 RUN pip install --no-cache-dir --upgrade -r requirements.txt
 
-# CRITICAL STEP (CORRECTED): Use the official Crawl4ai setup command
-# This handles the installation of Playwright and its browser dependencies.
-RUN crawl4ai-setup
+# CRITICAL STEP (CORRECTED): Use the direct playwright command
+# This is the underlying command that `crawl4ai-setup` uses and is more reliable in Docker.
+RUN python -m playwright install chromium
 
 # Copy the rest of your application code into the container
 COPY --chown=appuser:appuser . .
