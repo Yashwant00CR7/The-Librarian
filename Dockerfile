@@ -8,14 +8,17 @@ WORKDIR /code
 RUN useradd -m appuser
 USER appuser
 
+# --- CORRECTED: Add the user's local bin to the PATH ---
+# This ensures that executables installed by pip (like uvicorn) can be found.
+ENV PATH="/home/appuser/.local/bin:${PATH}"
+
 # Copy the requirements file first to leverage Docker's caching
 COPY --chown=appuser:appuser requirements.txt .
 
 # Install the Python dependencies
 RUN pip install --no-cache-dir --upgrade -r requirements.txt
 
-# CRITICAL STEP (CORRECTED): Use the direct playwright command
-# This is the underlying command that `crawl4ai-setup` uses and is more reliable in Docker.
+# CRITICAL STEP: Install the browser binaries needed by Crawl4ai
 RUN python -m playwright install chromium
 
 # Copy the rest of your application code into the container
