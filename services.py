@@ -81,7 +81,7 @@ def _sanitize_filename(name: str) -> str:
 
 def save_to_cache(library_name: str, library_data):
     """Saves library data to a local cache file with timestamp."""
-    cache_dir = "cache"
+    cache_dir = os.path.join("/tmp", "cache")
     if not os.path.exists(cache_dir):
         os.makedirs(cache_dir)
 
@@ -107,7 +107,7 @@ def save_to_cache(library_name: str, library_data):
 
 def load_from_cache(library_name: str, max_age_hours: int = 24):
     """Loads library data from cache if it exists and is not expired."""
-    cache_dir = "cache"
+    cache_dir = os.path.join("/tmp", "cache")
     safe_filename = _sanitize_filename(library_name)
     cache_file = os.path.join(cache_dir, f"{safe_filename}_cache.json")
 
