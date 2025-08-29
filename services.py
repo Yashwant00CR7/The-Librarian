@@ -1,6 +1,6 @@
-# --- MCP Server: Services Module ---
-# This file contains the core logic of the agent, including its tools,
-# reasoning prompt, and all helper functions for interacting with external services.
+# --- MCP Server: Services Module (Async-Aware) ---
+# This file contains the core logic of the agent. Key data pipeline functions
+# have been updated to be fully asynchronous to support async libraries like crawl4ai.
 
 import os
 import getpass
@@ -16,7 +16,6 @@ from datetime import datetime, timedelta
 # --- Core LangChain & Pydantic Imports ---
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.documents import Document
-from langchain_core.messages import AIMessage
 from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
@@ -46,7 +45,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
-# --- Pydantic Schema for Rich Data Extraction (UNCHANGED) ---
+# --- Pydantic Schema for Rich Data Extraction ---
 class LibraryInfo(BaseModel):
     """A structured representation of key information about a software library."""
     library_name: Optional[str] = Field(description="The official name of the library (e.g., 'scikit-learn')")
@@ -60,7 +59,7 @@ class LibraryInfo(BaseModel):
     confidence_score: Optional[str] = Field(description="Self-evaluated confidence level: 'High', 'Medium', or 'Low'.")
     additional_insights: Optional[str] = Field(description="Important information discovered during low-confidence rescraping.")
 
-# --- Service Initialization, Caching, Confidence Score (UNCHANGED) ---
+# --- Service Initialization, Caching, Confidence Score ---
 def load_api_keys():
     """Securely loads API keys, prompting the user if they are not set."""
     if "GOOGLE_API_KEY" not in os.environ:
@@ -72,7 +71,12 @@ def initialize_services():
     """Initializes and returns the core AI and database clients."""
     llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
     embeddings_model = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-    pc = Pinecone()
+    
+    pinecone_api_key = os.getenv("PINECONE_API_KEY")
+    if not pinecone_api_key:
+        raise ValueError("PINECONE_API_KEY environment variable not set.")
+    pc = Pinecone(api_key=pinecone_api_key)
+    
     return llm, embeddings_model, pc
 
 def _sanitize_filename(name: str) -> str:
@@ -81,7 +85,7 @@ def _sanitize_filename(name: str) -> str:
 
 def save_to_cache(library_name: str, library_data):
     """Saves library data to a local cache file with timestamp."""
-    cache_dir = os.path.join("/tmp", "cache")
+    cache_dir = "cache"
     if not os.path.exists(cache_dir):
         os.makedirs(cache_dir)
 
@@ -99,7 +103,7 @@ def save_to_cache(library_name: str, library_data):
     }
 
     try:
-        with open(cache_file, 'w') as f:
+        with open(cache_file, 'w', encoding='utf-8') as f:
             json.dump(cache_entry, f, indent=2)
         logger.info(f"💾 Cached data for '{library_name}'")
     except Exception as e:
@@ -107,7 +111,7 @@ def save_to_cache(library_name: str, library_data):
 
 def load_from_cache(library_name: str, max_age_hours: int = 24):
     """Loads library data from cache if it exists and is not expired."""
-    cache_dir = os.path.join("/tmp", "cache")
+    cache_dir = "cache"
     safe_filename = _sanitize_filename(library_name)
     cache_file = os.path.join(cache_dir, f"{safe_filename}_cache.json")
 
@@ -115,7 +119,7 @@ def load_from_cache(library_name: str, max_age_hours: int = 24):
         return None
 
     try:
-        with open(cache_file, 'r') as f:
+        with open(cache_file, 'r', encoding='utf-8') as f:
             cache_entry = json.load(f)
 
         cache_time = datetime.fromisoformat(cache_entry["timestamp"])
@@ -145,11 +149,11 @@ def interpret_confidence_score(confidence_score: str) -> str:
         return f"❓ Unknown Confidence Level: {confidence_score}"
 
 
-# --- Specialist Agent Tools and Web Search (UNCHANGED) ---
+# --- Specialist Agent Tools ---
 @tool
 def pypi_api_tool(package_name: str) -> str:
     """Queries the official PyPI API for a Python package's metadata."""
-    print(f" 	-> 🛠️ Using PyPI API Tool for '{package_name}'...")
+    logger.info(f"-> 🛠️ Using PyPI API Tool for '{package_name}'...")
     try:
         response = requests.get(f"https://pypi.org/pypi/{package_name}/json")
         response.raise_for_status()
@@ -165,7 +169,7 @@ def pypi_api_tool(package_name: str) -> str:
 @tool
 def npm_api_tool(package_name: str) -> str:
     """Queries the official npm registry API for a JavaScript/Node.js package's metadata."""
-    print(f" 	-> 🛠️ Using npm API Tool for '{package_name}'...")
+    logger.info(f"-> 🛠️ Using npm API Tool for '{package_name}'...")
     try:
         response = requests.get(f"https://registry.npmjs.org/{package_name}")
         response.raise_for_status()
@@ -180,7 +184,7 @@ def npm_api_tool(package_name: str) -> str:
 @tool
 def crates_io_api_tool(package_name: str) -> str:
     """Queries the official Crates.io API for a Rust package's metadata."""
-    print(f" 	-> 🛠️ Using Crates.io API Tool for '{package_name}'...")
+    logger.info(f"-> 🛠️ Using Crates.io API Tool for '{package_name}'...")
     try:
         response = requests.get(f"https://crates.io/api/v1/crates/{package_name}")
         response.raise_for_status()
@@ -194,86 +198,43 @@ def crates_io_api_tool(package_name: str) -> str:
 
 @tool
 def web_search_tool(query: str) -> str:
-    """Performs a web search using DuckDuckGo first, then falls back to Tavily AI if no valid URLs are found."""
-    print(f" 	-> 🛠️ Using Web Search Tool for '{query}'...")
-
+    """Performs a web search using DuckDuckGo first, then falls back to Tavily AI."""
+    logger.info(f"-> 🛠️ Using Web Search Tool for '{query}'...")
     try:
-        print(" 	-> 🔍 Attempting DuckDuckGo search...")
+        logger.info("  -> 🔍 Attempting DuckDuckGo search...")
         wrapper = DuckDuckGoSearchAPIWrapper(time="y", max_results=5, region="us-en")
         ddg_results = wrapper.run(query)
-        if ddg_results and any(url in ddg_results for url in ['http://', 'https://']):
-            print(" 	-> ✅ DuckDuckGo search successful!")
+        if ddg_results and 'http' in ddg_results:
+            logger.info("  -> ✅ DuckDuckGo search successful!")
             return ddg_results
-        print(" 	-> ⚠️ DuckDuckGo found no valid URLs, falling back to Tavily AI...")
+        logger.warning("  -> ⚠️ DuckDuckGo found no valid URLs, falling back to Tavily AI...")
     except Exception as e:
-        print(f" 	-> ❌ DuckDuckGo search failed: {e}, falling back to Tavily AI...")
+        logger.error(f"  -> ❌ DuckDuckGo search failed: {e}, falling back to Tavily AI...")
 
     try:
         if not os.getenv("TAVILY_API_KEY"):
             return "Error: Tavily API key not found. Please set TAVILY_API_KEY."
-        print(" 	-> 🤖 Using LangChain-aware Tavily AI as fallback...")
+        logger.info("  -> 🤖 Using LangChain-aware Tavily AI as fallback...")
         tavily_tool = TavilySearchResults(max_results=5)
         results = tavily_tool.invoke({"query": query})
-        print(" 	-> ✅ Tavily AI search successful!")
+        logger.info("  -> ✅ Tavily AI search successful!")
         return str(results)
     except Exception as e:
-        print(f" 	-> ❌ Tavily AI search also failed: {e}")
+        logger.error(f"  -> ❌ Tavily AI search also failed: {e}")
         return f"Both DuckDuckGo and Tavily AI searches failed. Error: {e}"
 
-@tool
-def smart_web_search_with_retry(query: str, original_results: str = None) -> str:
-    """
-    Smart web search that automatically retries with alternative strategies when
-    the original results indicate broken links, 404 errors, or invalid documentation.
-    """
-    print(f" 	-> 🔄 Smart web search with retry for '{query}'...")
-
-    needs_retry = False
-    if original_results:
-        url_problem_indicators = [
-            "url might not be the actual documentation", "404 error", "not found",
-            "broken link", "invalid url", "page not available", "link returns a 404",
-            "wrong documentation", "incorrect url", "misleading link"
-        ]
-        if any(indicator.lower() in original_results.lower() for indicator in url_problem_indicators):
-            needs_retry = True
-
-    if needs_retry:
-        print(" 	-> ⚠️ URL/documentation problems detected. Attempting alternative search strategies...")
-        if not os.getenv("TAVILY_API_KEY"):
-            return "Error: Tavily API key not found for retry. Please set TAVILY_API_KEY."
-
-        tavily_tool = TavilySearchResults(max_results=5)
-        retry_strategies = [
-            f"{query} documentation official",
-            f"{query} developer guide api reference",
-            f"{query} API guide tutorial examples",
-            f"{query} GitHub source code repository"
-        ]
-
-        for i, strategy_query in enumerate(retry_strategies):
-            print(f" 	-> 🔍 Retry Strategy {i+1}: '{strategy_query}'")
-            try:
-                results = tavily_tool.invoke({"query": strategy_query})
-                if results:
-                    print(" 	-> ✅ Alternative search successful!")
-                    return f"Alternative search results for '{query}':\n\n" + str(results)
-            except Exception as e:
-                print(f" 	-> ❌ Strategy {i+1} failed: {e}")
-
-        return "All retry strategies failed to find a working URL."
-    else:
-        print(" 	-> ✅ No URL/documentation problems detected. Using normal web search.")
-        return web_search_tool(query)
-
-# --- Agent Creation (UNCHANGED) ---
 def create_universal_agent(llm):
     """Creates the multi-ecosystem agent with the most robust reasoning process."""
-    tools = [pypi_api_tool, npm_api_tool, crates_io_api_tool, smart_web_search_with_retry]
-
+    tools = [pypi_api_tool, npm_api_tool, crates_io_api_tool, web_search_tool]
     prompt = ChatPromptTemplate.from_messages([
         ("system",
-         "You are an expert documentation research assistant... Your goal is to find the single, best, official, content-rich documentation URL..."),
+         "You are an expert documentation research assistant. Your goal is to find the single, best, official documentation URL for a given software library. "
+         "You must follow this exact strategy:\n"
+         "1. **Analyze and Refine the Query:** Before using any tools, analyze the input library name. Is it a common alias or abbreviation? For example, if the input is 'sklearn', you must recognize the official name is 'scikit-learn' and use 'scikit-learn' for all subsequent steps.\n"
+         "2. **Use Specialist Tools First:** Use the refined, official name with the appropriate specialist tool (e.g., pypi_api_tool for 'scikit-learn'). This is your preferred first action.\n"
+         "3. **Fallback to Web Search:** If the specialist tool fails or returns no URL, you must then use the web_search_tool with the refined, official name.\n"
+         "4. **Filter by Language:** You MUST ignore and discard any search results from non-English domains (e.g., .cn, .jp, .ru, .de). Only consider English-language results.\n"
+         "5. **Self-Correct on Failure:** If your first web search with the refined name fails, do not give up. Try one more time with a broader query. For example, if a search for 'google photos picker api' fails, try a new search for 'google photos api developer documentation'."),
         ("human", "{input}"),
         ("placeholder", "{agent_scratchpad}"),
     ])
@@ -319,33 +280,18 @@ def _fetch_with_jina(url: str) -> Optional[str]:
 
 async def _deep_crawl_with_crawl4ai(url: str) -> Optional[str]:
     """
-    Performs a deep crawl starting from the given URL to gather rich context
-    from multiple linked pages using the latest Crawl4ai method.
+    Performs a deep crawl starting from the given URL to gather rich context.
     """
     try:
         logger.info(f"🤖 [Deep Crawl] Initiating deep crawl for: {url}")
-
-        user_agent = (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-        )
-        crawler_params = {"user_agent": user_agent, "headless": True}
-
-        # 1. Define the deep crawl strategy
-        strategy = BFSDeepCrawlStrategy(max_depth=1) # Crawl the starting page + 1 level of links
-
-        # 2. Configure the run to use the deep crawl strategy
+        strategy = BFSDeepCrawlStrategy(max_depth=1)
         run_config = CrawlerRunConfig(
             deep_crawl_strategy=strategy,
             markdown_generator=DefaultMarkdownGenerator()
         )
-
         all_content = []
-        async with AsyncWebCrawler(**crawler_params) as crawler:
-            # 3. Use the standard arun() method. It will return a list of results.
+        async with AsyncWebCrawler() as crawler:
             results = await crawler.arun(url=url, config=run_config)
-            
-            # 4. Iterate through the list of results from the crawl
             if results:
                 for result in results:
                     if result.success and result.markdown:
@@ -358,24 +304,28 @@ async def _deep_crawl_with_crawl4ai(url: str) -> Optional[str]:
         
         logger.info(f"✅ Deep crawl successful. Aggregated content from {len(all_content)} pages.")
         return "\n\n--- (New Page Content) ---\n\n".join(all_content)
-
     except Exception as e:
-        logger.error(f"❌ Deep crawl failed with a critical error.")
-        import traceback
-        traceback.print_exc()
+        logger.error(f"❌ Deep crawl failed with a critical error: {e}")
         return None
-def get_clean_content(doc_url: str) -> Optional[str]:
-    """
-    Fetches clean content from a single URL using Jina AI.
-    """
-    return _fetch_with_jina(doc_url)
 
-def ingest_documentation(library_name: str, doc_url: str, embeddings_model, content_to_ingest: Optional[str] = None):
+async def get_clean_content(doc_url: str) -> Optional[str]:
+    """
+    Hybrid content fetcher. First tries Jina AI, then falls back to a deep
+    crawl with Crawl4ai if Jina fails.
+    """
+    jina_content = _fetch_with_jina(doc_url)
+    if jina_content and len(jina_content) >= MIN_CONTENT_LENGTH_THRESHOLD:
+        logger.info("Jina AI content is valid and of sufficient length.")
+        return jina_content
+
+    logger.warning("Jina API failed or content was too short. Triggering deep crawl fallback.")
+    return await _deep_crawl_with_crawl4ai(doc_url)
+
+async def ingest_documentation(library_name: str, doc_url: str, embeddings_model, content_to_ingest: Optional[str] = None):
     """
     Deletes old vectors for the library, then gets clean content and stores the new vectors.
     """
     logger.info(f"\n📚 Starting ingestion for '{library_name}'...")
-    
     doc_id = f"lib-{_sanitize_filename(library_name)}"
     
     try:
@@ -386,9 +336,11 @@ def ingest_documentation(library_name: str, doc_url: str, embeddings_model, cont
     except Exception as e:
         logger.warning(f"⚠️ Could not delete old vectors (they may not exist): {e}")
 
+    # Use pre-fetched content if provided, otherwise fetch it.
     if content_to_ingest is None:
-        content_string = get_clean_content(doc_url)
+        content_string = await get_clean_content(doc_url)
     else:
+        logger.info("Using pre-fetched content for ingestion.")
         content_string = content_to_ingest
 
     if not content_string:
@@ -406,30 +358,42 @@ def ingest_documentation(library_name: str, doc_url: str, embeddings_model, cont
             split.metadata["doc_id"] = doc_id
 
         logger.info(f"Embedding {len(splits)} new document chunks and storing in Pinecone...")
-        PineconeVectorStore.from_documents(splits, embeddings_model, index_name=PINECONE_INDEX_NAME)
+        await PineconeVectorStore.afrom_documents(splits, embeddings_model, index_name=PINECONE_INDEX_NAME)
         logger.info("✅ New content ingested successfully.")
         return True
     except Exception as e:
         logger.error(f"❌ An error occurred during chunking or embedding: {e}")
         return False
 
-def extract_structured_info(library_name: str, llm, embeddings_model, doc_url: str = None) -> Optional[LibraryInfo]:
-    """Retrieves context from Pinecone and uses an LLM to extract rich, structured information."""
-    logger.info(f"\n⛏️ Extracting structured info for '{library_name}' using RAG...")
+async def extract_structured_info(library_name: str, llm, embeddings_model, doc_url: str) -> LibraryInfo:
+    """
+    Retrieves context from Pinecone and uses an LLM to extract rich, structured information.
+    Implements a two-stage fallback for low-confidence results.
+    """
+    logger.info(f"\n⛏️ Starting structured info extraction for '{library_name}'...")
+
     try:
-        ingestion_success = ingest_documentation(library_name, doc_url, embeddings_model)
+        # --- Stage 1: Quick Pass with Initial Content ---
+        logger.info("--- Stage 1: Performing initial RAG extraction ---")
+        initial_content = await get_clean_content(doc_url)
+        if not initial_content:
+            logger.error("Initial content fetch failed. Cannot proceed with extraction.")
+            return LibraryInfo(library_name=library_name, confidence_score="Low", additional_insights="Initial content scraping failed.")
+
+        ingestion_success = await ingest_documentation(library_name, doc_url, embeddings_model, content_to_ingest=initial_content)
         if not ingestion_success:
-            return None
+             return LibraryInfo(library_name=library_name, confidence_score="Low", additional_insights="Initial content ingestion failed.")
+
 
         vectorstore = PineconeVectorStore.from_existing_index(PINECONE_INDEX_NAME, embeddings_model)
         retriever = vectorstore.as_retriever(search_kwargs={'k': 8})
         
-        docs = retriever.invoke(f"Information about {library_name} including purpose, installation, and version.")
+        docs = await retriever.ainvoke(f"Information about {library_name} including purpose, installation, version, and deprecation notices.")
         context_text = "\n\n".join([doc.page_content for doc in docs])
 
         if not context_text:
             logger.warning(f"⚠️ Could not retrieve any context for '{library_name}' from Pinecone.")
-            return LibraryInfo(library_name=library_name, confidence_score="Low")
+            return LibraryInfo(library_name=library_name, confidence_score="Low", documentation_url=doc_url)
 
         structured_llm = llm.with_structured_output(LibraryInfo)
         prompt = ChatPromptTemplate.from_messages([
@@ -438,43 +402,77 @@ def extract_structured_info(library_name: str, llm, embeddings_model, doc_url: s
         ])
 
         chain = prompt | structured_llm
-        response = chain.invoke({"topic": library_name, "context": context_text})
+        initial_response = await chain.ainvoke({"topic": library_name, "context": context_text})
 
-        if response and doc_url:
-            response.documentation_url = doc_url
+        if initial_response and doc_url:
+            initial_response.documentation_url = doc_url
+        
+        # --- Stage 2: Confidence Check and Deep Crawl Fallback ---
+        is_confident = initial_response.confidence_score and initial_response.confidence_score.lower() in ["high", "medium"]
 
-        # --- CORRECTED: A more robust "allow-list" check for confidence ---
-        # The fallback will now trigger unless the score is explicitly "High" or "Medium".
-        is_confident = response.confidence_score and response.confidence_score.lower() in ["high", "medium"]
-
-        if doc_url and not is_confident:
+        if not is_confident:
             logger.warning(f"⚠️ Low or Unknown confidence for '{library_name}'. Triggering deep crawl fallback...")
             
-            rich_content = asyncio.run(_deep_crawl_with_crawl4ai(doc_url))
+            # This is where the deep crawl was intended but the logic was flawed.
+            # We now perform the deep crawl and then re-run the extraction.
+            rich_content = await _deep_crawl_with_crawl4ai(doc_url)
             
             if rich_content:
-                reingestion_success = ingest_documentation(library_name, doc_url, embeddings_model, content_to_ingest=rich_content)
-
+                logger.info("--- Stage 2: Re-ingesting with richer content from deep crawl ---")
+                reingestion_success = await ingest_documentation(library_name, doc_url, embeddings_model, content_to_ingest=rich_content)
+                
                 if reingestion_success:
-                    logger.info("Re-running structured extraction with richer context from deep crawl...")
-                    new_docs = retriever.invoke(f"Information about {library_name} including purpose, installation, and version.")
+                    logger.info("--- Stage 2: Re-running structured extraction with new context ---")
+                    # Retrieve the new, richer context
+                    new_docs = await retriever.ainvoke(f"Information about {library_name} including purpose, installation, and version.")
                     new_context_text = "\n\n".join([doc.page_content for doc in new_docs])
-                    new_response = chain.invoke({"topic": library_name, "context": new_context_text})
                     
-                    if new_response:
-                        new_response.documentation_url = doc_url
-                        new_response.additional_insights = (
+                    # Re-run the extraction chain
+                    final_response = await chain.ainvoke({"topic": library_name, "context": new_context_text})
+                    
+                    if final_response:
+                        final_response.documentation_url = doc_url
+                        final_response.additional_insights = (
                             "Low confidence triggered a deep crawl to improve data quality.\n"
-                            + (new_response.additional_insights or "")
+                            + (final_response.additional_insights or "")
                         )
-                    
-                    logger.info("✅ Structured information extracted successfully after deep crawl.")
-                    return new_response
-            else:
-                logger.error("❌ Deep crawl fallback failed to produce content. Returning initial low-confidence result.")
+                        logger.info("✅ Structured information extracted successfully after deep crawl.")
+                        return final_response
+            
+            logger.error("❌ Deep crawl fallback failed to produce better results. Returning initial low-confidence data.")
+            return initial_response # Return the first result if deep crawl fails
 
-        logger.info("✅ Structured information extracted successfully.")
-        return response
+        logger.info("✅ Structured information extracted successfully on the first pass.")
+        return initial_response
+
     except Exception as e:
-        logger.error(f"❌ Error during structured data extraction: {e}")
+        logger.error(f"❌ A critical error occurred during structured data extraction: {e}")
+        return LibraryInfo(
+            library_name=library_name,
+            documentation_url=doc_url,
+            confidence_score="Low",
+            additional_insights=f"A critical error occurred: {str(e)}"
+        )
+
+def find_documentation_url(agent_executor, library_name: str) -> str | None:
+    """
+    Uses the agent to find the official documentation URL for a library.
+    """
+    logger.info(f"\n🕵️ Agent is searching for documentation for '{library_name}'...")
+    try:
+        # Agent invocation is synchronous
+        response = agent_executor.invoke({"input": f"Find the documentation URL for the {library_name} library."})
+        output = response.get("output", "")
+        
+        url_match = re.search(r'https?://[^\s,"]+', output)
+        if url_match:
+            doc_url = url_match.group(0).strip().strip(' ./\t\n')
+            logger.info(f"✅ Agent found URL: {doc_url}")
+            return doc_url
+        else:
+            logger.error(f"❌ Agent failed to find a valid URL in its output: {output}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"❌ An error occurred while the agent was searching: {e}")
         return None

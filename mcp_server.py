@@ -14,22 +14,18 @@ from contextlib import asynccontextmanager
 from services import (
     initialize_services,
     create_universal_agent,
-    _sanitize_filename,
     ensure_pinecone_index_ready,
     extract_structured_info,
     load_from_cache,
     save_to_cache,
     interpret_confidence_score,
-    # find_documentation_url,
     logger,
-    PineconeVectorStore # Import for the /ask endpoint
+    PineconeVectorStore,
+    _sanitize_filename,
+    find_documentation_url
 )
 
-from main import find_documentation_url
-
 # --- Data Models for API Requests ---
-# These Pydantic models define the expected JSON structure for incoming requests.
-
 class ProcessRequest(BaseModel):
     """The request model for processing a new library."""
     library_name: str
@@ -40,32 +36,33 @@ class AskRequest(BaseModel):
     question: str
 
 # --- Global State Management ---
-# This dictionary will hold our initialized services (LLM, agent, etc.)
-# so they are created only once when the server starts, not on every request.
 server_state = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    This function runs on server startup and shutdown. It's the perfect place
-    to initialize our models and services so they are ready to handle requests.
+    This function runs on server startup and shutdown to initialize models and services.
     """
     print("--- Server is starting up... ---")
     load_dotenv()
     
-    # Initialize all the core components of the Librarian
-    llm, embeddings_model, pc = initialize_services()
-    ensure_pinecone_index_ready(pc, embeddings_model)
-    agent_executor = create_universal_agent(llm)
+    try:
+        llm, embeddings_model, pc = initialize_services()
+        ensure_pinecone_index_ready(pc, embeddings_model)
+        agent_executor = create_universal_agent(llm)
+        
+        server_state["llm"] = llm
+        server_state["embeddings_model"] = embeddings_model
+        server_state["agent_executor"] = agent_executor
+        
+        print("--- Models and services initialized. Server is ready. ---")
+    except Exception as e:
+        # If initialization fails, log the error. The server won't start correctly.
+        logger.critical(f"FATAL: Server startup failed during initialization: {e}")
+        # In a real production scenario, you might want to exit or handle this differently.
     
-    # Store the initialized components in our server_state dictionary
-    server_state["llm"] = llm
-    server_state["embeddings_model"] = embeddings_model
-    server_state["agent_executor"] = agent_executor
-    
-    print("--- Models and services initialized. Server is ready. ---")
     yield
-    # This part runs on shutdown
+    
     print("--- Server is shutting down... ---")
     server_state.clear()
 
@@ -83,42 +80,50 @@ app = FastAPI(
 async def process_library_endpoint(request: ProcessRequest):
     """
     This endpoint runs the full Librarian pipeline for a given library name.
-    It checks the cache, finds the documentation, ingests it, and returns
-    the structured information.
     """
     library_name = request.library_name
     logger.info(f"Received request to process library: {library_name}")
 
-    # 1. Check Cache
-    cached_data = load_from_cache(library_name)
-    if cached_data:
-        logger.info(f"Cache hit for '{library_name}'. Returning cached data.")
-        return cached_data
+    try:
+        # 1. Check Cache
+        cached_data = load_from_cache(library_name)
+        if cached_data:
+            logger.info(f"Cache hit for '{library_name}'. Returning cached data.")
+            return cached_data
 
-    # 2. Find URL with the Agent
-    doc_url = find_documentation_url(server_state["agent_executor"], library_name)
-    if not doc_url:
-        raise HTTPException(status_code=404, detail=f"Agent failed to find a valid URL for '{library_name}'.")
+        # 2. Find URL with the Agent
+        doc_url = find_documentation_url(server_state["agent_executor"], library_name)
+        if not doc_url:
+            raise HTTPException(status_code=404, detail=f"Agent failed to find a valid URL for '{library_name}'.")
 
-    # 3. Extract Info (this function now contains the full ingestion and fallback logic)
-    library_info = extract_structured_info(
-        library_name=library_name,
-        llm=server_state["llm"],
-        embeddings_model=server_state["embeddings_model"],
-        doc_url=doc_url
-    )
+        # 3. Extract Info (this function contains the full ingestion and fallback logic)
+        # CORRECTED: Added 'await' to properly call the asynchronous function
+        library_info = await extract_structured_info(
+            library_name=library_name,
+            llm=server_state["llm"],
+            embeddings_model=server_state["embeddings_model"],
+            doc_url=doc_url
+        )
 
-    if not library_info:
-        raise HTTPException(status_code=500, detail="Failed to extract structured information after ingestion.")
+        if not library_info:
+            raise HTTPException(status_code=500, detail="Failed to extract structured information after ingestion.")
 
-    # 4. Save to cache ONLY if confidence is high or medium
-    info_dict = library_info.model_dump()
-    if library_info.confidence_score and library_info.confidence_score.lower() in ["high", "medium"]:
-        save_to_cache(library_name, info_dict)
-    else:
-        logger.warning(f"Skipping cache for '{library_name}' due to low or unknown confidence.")
+        # 4. Save to cache ONLY if confidence is high or medium
+        info_dict = library_info.model_dump()
+        if library_info.confidence_score and library_info.confidence_score.lower() in ["high", "medium"]:
+            save_to_cache(library_name, info_dict)
+        else:
+            logger.warning(f"Skipping cache for '{library_name}' due to low or unknown confidence.")
 
-    return info_dict
+        return info_dict
+    
+    except HTTPException as http_exc:
+        # Re-raise HTTP exceptions directly
+        raise http_exc
+    except Exception as e:
+        # Catch any other unexpected errors and return a proper 500 error
+        logger.error(f"An unexpected error occurred in /process_library for '{library_name}': {e}")
+        raise HTTPException(status_code=500, detail=f"An internal server error occurred: {str(e)}")
 
 @app.post("/ask", response_model=dict)
 async def ask_endpoint(request: AskRequest):
@@ -131,26 +136,21 @@ async def ask_endpoint(request: AskRequest):
     logger.info(f"Received question about '{library_name}': '{question}'")
 
     try:
-        # 1. Connect to the existing Pinecone index
         vectorstore = PineconeVectorStore.from_existing_index(
             index_name=os.getenv("PINECONE_INDEX_NAME", "mcp-documentation-index"),
             embedding=server_state["embeddings_model"]
         )
 
-        # 2. Create a retriever to search for relevant documents
-        # We filter by the doc_id to only search within the specified library's docs
         doc_id = f"lib-{_sanitize_filename(library_name)}"
         retriever = vectorstore.as_retriever(
             search_kwargs={'k': 5, 'filter': {'doc_id': doc_id}}
         )
 
-        # 3. Perform the search
         docs = retriever.invoke(question)
 
         if not docs:
             return {"answer": "I could not find any relevant information in the documentation for that library. It might not have been processed yet."}
 
-        # 4. Combine the context and return it
         context = "\n\n---\n\n".join([doc.page_content for doc in docs])
         
         return {
@@ -161,7 +161,7 @@ async def ask_endpoint(request: AskRequest):
 
     except Exception as e:
         logger.error(f"Error during RAG retrieval for '{library_name}': {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to retrieve information. Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve information. Error: {str(e)}")
 
 
 # --- Run the Server ---

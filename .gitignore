@@ -1,0 +1,4 @@
+build cmd
+__pycache__
+.env
+start code

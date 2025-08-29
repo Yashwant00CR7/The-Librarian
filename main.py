@@ -1,124 +1,101 @@
+# --- MCP Server: Main Orchestrator (Async) ---
+# This file is the entry point for the application. It has been updated
+# to use Python's asyncio to correctly manage the asynchronous crawling
+# and data processing pipeline.
+
 import os
+import json
 import re
-import time
+import asyncio # Import the asyncio library
 from dotenv import load_dotenv
 
-# --- Local Imports from your project ---
+# --- Local Imports from our services module ---
 from services import (
-    initialize_services,
     create_universal_agent,
     ensure_pinecone_index_ready,
     extract_structured_info,
-    load_from_cache,
+    load_api_keys,
+    initialize_services,
     save_to_cache,
+    load_from_cache,
     interpret_confidence_score,
-    logger # Import logger to use it
+    find_documentation_url # Re-added for clarity in the main loop
 )
 
-# --- Main Application Logic ---
-
-def find_documentation_url(agent_executor, library_name: str) -> str | None:
-    """
-    Uses the agent to find the official documentation URL for a library.
-    """
-    print(f"\n🕵️ Agent is searching for documentation for '{library_name}'...")
-    try:
-        response = agent_executor.invoke({"input": f"Find the documentation URL for the {library_name} library."})
-        output = response.get("output", "")
-        
-        url_match = re.search(r'https?://[^\s,"]+', output)
-        if url_match:
-            doc_url = url_match.group(0).strip().strip(' ./\t\n')
-            print(f"✅ Agent found URL: {doc_url}")
-            return doc_url
-        else:
-            print(f"❌ Agent failed to find a valid URL in its output: {output}")
-            return None
-            
-    except Exception as e:
-        print(f"❌ An error occurred while the agent was searching: {e}")
-        return None
-
-def main():
-    """
-    The main pipeline orchestrator for the Librarian AI system.
-    """
+# The main function is now an async function
+async def main():
+    """Main async function to orchestrate the full documentation pipeline."""
     load_dotenv()
-    llm, embeddings_model, pc = initialize_services()
-    ensure_pinecone_index_ready(pc, embeddings_model)
-    agent_executor = create_universal_agent(llm)
+    load_api_keys()
     
-    # --- Define the Single Library to Process ---
-    library_to_process = "conscience"
-
-    libraries_to_process = [
-          # "sklearn",
-          # "Pillow",
-          # "requests",
-          # "@angular/core",
-          # "conscience",
-          # "tokio",
-          # "tensorflow-gpu",
-          # "godot",
-          # "BeautifulSoup4",
-          # "inquirer"
-    ]
-    
-    print("-" * 60)
-    print(f"🚀 STARTING LIBRARIAN PIPELINE FOR: '{library_to_process}'")
-    print("-" * 60)
-
-    # --- Check Cache First ---
-    cached_data = load_from_cache(library_to_process)
-    if cached_data:
-        print("\n✅ Found valid data in cache. Displaying cached results.")
-        confidence_meaning = interpret_confidence_score(cached_data.get("confidence_score"))
-        print(f"\n--- CACHED RESULTS for {library_to_process} ---")
-        print(f"  Confidence: {confidence_meaning}")
-        for key, value in cached_data.items():
-            if value:
-                print(f"  - {key.replace('_', ' ').title()}: {value}")
-        print("-" * 60)
-        return # End the process if we have a good cache hit
-
-    # --- Run Agent to Find URL ---
-    doc_url = find_documentation_url(agent_executor, library_to_process)
-    
-    if not doc_url:
-        print(f"\n❌ Halting pipeline for '{library_to_process}': Agent failed to find a valid URL.")
+    try:
+        llm, embeddings_model, pc = initialize_services()
+    except Exception as e:
+        print(f"❌ Failed to initialize core services: {e}")
         return
 
-    # --- Extract Structured Information ---
-    library_info = extract_structured_info(
-        library_name=library_to_process,
-        llm=llm,
-        embeddings_model=embeddings_model,
-        doc_url=doc_url
-    )
+    # --- Libraries to test across different ecosystems ---
+    libraries_to_process = ["tokio", "requests", "sklearn"]
 
-    # --- Process and Display Final Results ---
-    if library_info:
-        print(f"\n✅ Pipeline completed successfully for '{library_to_process}'!")
-        confidence_meaning = interpret_confidence_score(library_info.confidence_score)
-        
-        print(f"\n--- FINAL RESULTS for {library_to_process} ---")
-        print(f"  Confidence: {confidence_meaning}")
-        
-        info_dict = library_info.model_dump()
-        for key, value in info_dict.items():
-            if value:
-                print(f"  - {key.replace('_', ' ').title()}: {value}")
+    ensure_pinecone_index_ready(pc, embeddings_model)
+    agent_executor = create_universal_agent(llm)
 
-        # --- CORRECTED CACHING LOGIC ---
-        # Only save to cache if the confidence is high or medium.
-        if library_info.confidence_score and library_info.confidence_score.lower() in ["high", "medium"]:
-            save_to_cache(library_to_process, library_info)
+    for target_library in libraries_to_process:
+        print("\n" + "=" * 60)
+        print(f"🚀 Starting MCP Server Pipeline for: '{target_library}'")
+        print("=" * 60)
+
+        cached_data = load_from_cache(target_library)
+        if cached_data:
+            print("✅ Cache Hit! Skipping agent and using cached data.")
+            library_data_dict = cached_data
         else:
-            logger.warning(f"⚠️ Skipping cache for '{library_to_process}' due to low or unknown confidence.")
-    else:
-        print(f"\n❌ Halting pipeline: Failed to extract structured information for '{library_to_process}'.")
-        
-    print("-" * 60)
+            print("⚠️ Cache Miss. Deploying agent to find documentation URL...")
+            
+            # Use the dedicated function to run the agent and get the URL
+            doc_url = find_documentation_url(agent_executor, target_library)
+            
+            if not doc_url:
+                print(f"\n❌ Halting pipeline: Agent failed to find a valid URL for '{target_library}'.")
+                continue
+            
+            # CORRECTED: Use 'await' for the async extract_structured_info function
+            # This function now handles ingestion internally.
+            library_data_model = await extract_structured_info(target_library, llm, embeddings_model, doc_url)
+
+            if library_data_model:
+                save_to_cache(target_library, library_data_model)
+                library_data_dict = library_data_model.model_dump()
+            else:
+                library_data_dict = None
+
+        if library_data_dict:
+            print("\n" + "-"*60)
+            print(f"📊 Final Data for '{target_library}':")
+            
+            confidence = library_data_dict.get('confidence_score')
+            insights = library_data_dict.get('additional_insights')
+
+            if confidence:
+                print(f"\n🔍 Confidence Assessment: {interpret_confidence_score(confidence)}")
+            if insights:
+                print(f"\n💡 Additional Insights:\n{insights}")
+
+            print("\n--- Full JSON Output ---")
+            print(json.dumps(library_data_dict, indent=2))
+            print("-" * 60)
+        else:
+            print(f"\n❌ Failed to get any data for '{target_library}'.")
+
 
 if __name__ == "__main__":
-    main()
+    # CORRECTED: Use asyncio.run() to start the async main function
+    # This is how you run the script from the command line for testing.
+    try:
+        asyncio.run(main())
+    except RuntimeError as e:
+        if "cannot run in a running event loop" in str(e):
+            print("ERROR: This script is being run in an environment that already has an event loop (like Jupyter or a web server).")
+            print("In that case, you should call 'await main()' from an async cell or function.")
+        else:
+            raise
