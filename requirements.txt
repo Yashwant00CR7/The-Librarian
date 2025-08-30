@@ -15,3 +15,5 @@ crawl4ai
 fastapi
 uvicorn
 asyncio
+mcp 
+python-dotenv
