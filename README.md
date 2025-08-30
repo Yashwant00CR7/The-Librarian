@@ -1,12 +1,3 @@
----
-title: Librarian MCP Server
-emoji: 📚
-colorFrom: blue
-colorTo: green
-sdk: docker
-app_port: 7860
----
-
 # Librarian - AI-Powered Documentation Intelligence System
 
 > *"Your personal AI librarian that never stops searching for the documentation you need"*
