@@ -1,164 +1,304 @@
-# Librarian - AI-Powered Documentation Intelligence System
+# Librarian
 
-> *"Your personal AI librarian that never stops searching for the documentation you need"*
+“Your personal AI librarian that never stops searching for the documentation you need.”
 
-> **🚧 Development Status**: Core infrastructure and self-correcting data pipeline are complete! MCP server implementation is the next major goal. See [Development Roadmap](https://www.google.com/search?q=%23-development-roadmap) for details.
+> Status: Core ingestion + self‑correcting pipeline + cloud + stdio MCP integration working. Ongoing: broader MCP feature surface & editor plugins.  
+> License: (none yet—add one before public release)
 
-Meet **Librarian**, your intelligent AI assistant for navigating the vast world of software documentation. Like a skilled librarian who knows exactly where to find the information you need, this system intelligently discovers, processes, and organizes documentation from multiple software ecosystems (Python, JavaScript, Rust, etc.).
+## TL;DR
+Give me a library name (PyPI / npm / crates.io). I:  
+1. Discover the richest real docs page (not a thin homepage)  
+2. Fast-scrape via Jina AI  
+3. If weak → deep crawl with Crawl4ai  
+4. Embed & refresh Pinecone (cosine, 768D)  
+5. Run RAG + confidence scoring  
+6. Serve structured results via:  
+	 - Local MCP (stdio) server (`mcp_stdio_server.py`)  
+	 - Cloud endpoints (`/process_library`, `/ask`) at `LIBRARIAN_CLOUD_URL`
 
-Librarian combines a sophisticated AI agent with a multi-stage, self-correcting data pipeline. It uses smart search strategies to find the most relevant and content-rich documentation, automatically deep-crawls websites to gather more context when needed, and never gives up on finding the information you need.
+---
 
-## 💡 **Why Librarian Exists**
+## 🔧 Implemented Capabilities
 
-**The Problem**: Every developer has been there - you're in the zone, coding away, when suddenly you hit a wall. Package errors, dependency conflicts, and documentation confusion kill your coding vibe. You spend hours debugging instead of building.
+- Multi‑ecosystem resolution (PyPI, npm, crates.io)
+- Intelligent documentation URL selection (Gemini 1.5 Flash + search)
+- Fast initial content extraction (Jina AI Reader)
+- Confidence scoring + conditional deep crawl fallback (Crawl4ai)
+- Deep multi‑page aggregation
+- Vector refresh (delete old → upsert new) in Pinecone serverless:
+	- Index: `mcp-documentation-index` (cosine, dim=768, us-east-1)
+- Gemini reasoning & structured summarization
+- Cache gated by confidence (Medium/High only)
+- Dual operation modes: Local MCP stdio + Cloud HTTP service
 
-**The Solution**: Librarian is designed as an **MCP** (Model Context Protocol) **Server** that connects to your code editor through your AI model. No more context switching, no more dependency nightmares. Just pure, uninterrupted coding flow.
+## 🧱 Architecture Overview
 
-**The Vision**: We believe developers should be able to **vibe code** without pressure. Librarian handles the heavy lifting of finding accurate documentation, resolving package conflicts, and providing the information you need - all through your existing AI workflow.
+### High-Level Data Flow
+1. Request (MCP stdio or Cloud HTTP)
+2. Ecosystem metadata fetch
+3. Candidate docs discovery (Gemini + DuckDuckGo + Tavily fallback)
+4. Initial scrape (Jina)
+5. Content quality + confidence evaluation
+6. (Optional) Deep crawl (Crawl4ai)
+7. Chunking + Embedding
+8. Pinecone index refresh
+9. RAG + structuring
+10. Response + optional cache
 
-**Connect** Librarian to your editor, and start building with confidence. No more package errors, no **more documentation confusion. Just you, your code, and your AI assistant working together seamlessly.**
+### Core Components
 
-## 🏗️ **Modular Architecture**
+| File | Responsibility |
+|------|----------------|
+| `config.py` | Env loading, constants (index name), Pydantic schemas |
+| `services.py` | Tools (ecosystem lookups, search, scraping), pipeline stages, embeddings, RAG |
+| `main.py` | Orchestrates one full ingestion run locally |
+| `agent.py` | Legacy/simple launcher |
+| `mcp_stdio_server.py` | MCP stdio adapter exposing actions |
+| `.vscode/mcp.json` | Local MCP client configuration |
+| `requirements.txt` | Dependencies |
+| `.env` | Local secrets (never commit real values) |
 
-The codebase is structured into three main components for better maintainability and scalability:
+### Conceptual Data Models
+- LibraryRequest { name, ecosystem? }
+- LibraryMetadata { name, version?, homepage?, candidates[] }
+- PageContent { url, raw_text, source(jina|crawl4ai), quality_score }
+- Chunk { id, library, text, embedding }
+- LibraryInfo { library_name, summary, documentation_url, confidence_score, additional_insights }
+- AskAnswer { answer, citations[], confidence }
 
-### 📁 **File Structure**
+---
 
+## 🗺️ Mermaid Diagrams
 
-librarian/
-├── config.py         # Configuration, schemas, and environment variables
-├── services.py       # Core logic, agent, tools, and data pipeline functions
-├── main.py           # Main orchestrator and pipeline runner
-├── agent.py          # Simple launcher (backward compatibility)
-├── requirements.txt  # Python dependencies
-└── .env              # API keys (create this file)
+### Flow
+```mermaid
+flowchart LR
+		A[Client (MCP / Cloud)] --> B[Request Handler]
+		B --> C[Library Resolver\n(PyPI / npm / Crates)]
+		C --> D[URL Discovery Agent\nGemini + DuckDuckGo + Tavily]
+		D --> E[Jina Fast Scrape]
+		E --> F{Confidence High?}
+		F -- Yes --> H[Chunk & Embed]
+		F -- No --> G[Deep Crawl\nCrawl4ai]
+		G --> H[Chunk & Embed]
+		H --> I[Pinecone Refresh\n(delete+upsert)]
+		I --> J[RAG + Structuring]
+		J --> K[Cache (if Medium/High)]
+		K --> L[Response]
+```
 
+### Sequence (Ask)
+```mermaid
+sequenceDiagram
+		participant C as Client
+		participant H as Handler
+		participant P as Pinecone
+		participant R as Retriever
+		participant G as Gemini
+		C->>H: ask(library, question)
+		H->>P: similarity query
+		P-->>H: top-k chunks
+		H->>R: assemble context
+		R->>G: prompt(context, question)
+		G-->>H: answer + reasoning
+		H-->>C: structured answer
+```
 
-### 🔧 **Module Breakdown**
+---
 
-#### 1. **`config.py`** - Configuration & Schemas
+## 🧠 Discovery Strategy
 
-* Environment variable loading and validation.
+- Reasoning model: `gemini-1.5-flash`
+- Search order: Ecosystem metadata → DuckDuckGo queries → Tavily fallback
+- URL scoring heuristics: Penalize marketing roots; prefer pages with heading density, code blocks, versioned paths; reject empty stubs.
 
-* Global constants (Pinecone index name, Jina Reader API URL).
+## 🧪 Confidence & Fallback
 
-* Pydantic `LibraryInfo` schema for structured data output.
+| Stage | Trigger |
+|-------|---------|
+| Deep Crawl | Confidence Low/Unknown OR text below length threshold |
+| Re-embed | Always after deep crawl |
+| Cache | Only Medium / High |
+| Ask pre-processing | If not indexed → run pipeline first |
 
-#### 2. **`services.py`** - Core Logic & Tools
+---
 
-* All agent tools (`pypi_api_tool`, `npm_api_tool`, `crates_io_api_tool`, `smart_web_search_with_retry`).
+## 🧰 Toolchain / Services
 
-* Creation of the sophisticated, multi-step AI agent.
+| Concern | Choice |
+|---------|--------|
+| Reasoning & extraction logic | Gemini 1.5 Flash |
+| Embeddings (768D) | Gemini embeddings endpoint |
+| Fast scrape | Jina AI Reader |
+| Deep crawl | Crawl4ai (`crawl4ai-setup` installs Chromium) |
+| Search | DuckDuckGo (primary), Tavily (fallback) |
+| Vector store | Pinecone serverless (cosine) |
+| Protocols | MCP stdio, Cloud HTTP |
+| Runtime | Python 3.11 |
 
-* Pinecone index management, including a "delete-then-add" refresh strategy.
+---
 
-* Hybrid content extraction pipeline (Jina AI + Crawl4ai).
+## ⚙️ Environment Variables
 
-* The self-correcting RAG logic with a deep crawl fallback.
+(Do NOT commit real key values. Rotate any leaked keys immediately.)
 
-#### 3. **`main.py`** - Pipeline Orchestrator
+```
+GEMINI_API_KEY=your_gemini_key
+GEMINI_MODEL=gemini-1.5-flash
+PINECONE_API_KEY=your_pinecone_key
+PINECONE_INDEX=mcp-documentation-index
+PINECONE_REGION=us-east-1
+TAVILY_API_KEY=your_tavily_key
+LIBRARIAN_CLOUD_URL=https://librarian-ai-agent-...run.app/
+# Optional / future:
+# CACHE_DIR=.cache/librarian
+```
 
-* Clean, focused main function that runs the entire pipeline.
+If you still have `GOOGLE_API_KEY` logic, keep it; remove if unused.
 
-* Intelligent caching logic that avoids storing low-quality results.
+---
 
-* Model and service initialization.
+## 📦 Installation (Local)
 
-## 🚀 **Librarian's Key Capabilities**
-
-* **Advanced AI Agent**: A highly intelligent agent with a multi-step reasoning process to find the best possible documentation URL, avoiding common pitfalls like generic homepages.
-
-* **Multi-Ecosystem Support**: Natively understands Python (PyPI), JavaScript (npm), and Rust (Crates.io).
-
-* **Hybrid Content Extraction**: Uses the fast Jina AI Reader API for initial scrapes and falls back to the powerful `Crawl4ai` library for more complex tasks.
-
-* **Self-Correcting Data Pipeline**: Automatically detects when an initial scrape yields low-quality or empty content.
-
-* **Deep Crawl Fallback**: When confidence is low, it automatically triggers a **deep crawl** with `Crawl4ai` to explore the documentation site, gather richer context from multiple pages, and re-process the data.
-
-* **Always-Fresh Vector Storage**: Before ingesting new documentation into Pinecone, it automatically deletes all old vectors for that library, ensuring the index is always up-to-date.
-
-* **Intelligent Caching**: Avoids "cache poisoning" by only saving results that have a "High" or "Medium" confidence score.
-
-## 🔍 **How Librarian Works: A Self-Correcting Pipeline**
-
-Librarian uses a sophisticated, multi-stage process to ensure it gets the highest quality information.
-
-1. **Intelligent Discovery**: The AI agent, equipped with a robust set of instructions, uses a combination of specialist API tools and contextual web searches to find the most **content-rich** documentation page, actively avoiding generic homepages or empty directory pages.
-
-2. **Initial** Scrape & **Ingestion**: The system uses the fast Jina AI Reader to scrape the content from the URL found by the agent. It then deletes any old information for that library from the Pinecone vector store and ingests this new content.
-
-3. **First-Pass Analysis (RAG)**: The system performs a Retrieval-Augmented Generation task, using the newly ingested content to extract structured information and a self-evaluated **confidence score**.
-
-4. **Confidence Check & Fallback Trigger**: The system checks the result. If the confidence score is "Low" or "Unknown" (indicating the initial scrape was insufficient), it triggers the deep crawl fallback.
-
-5. **Deep Crawl Exploration**: The system deploys `Crawl4ai` to perform a **deep crawl**, starting at the original URL and exploring linked pages to gather a much larger and richer set of content.
-
-6. **Re-Ingestion & Final Analysis**: The low-quality content is deleted from Pinecone and replaced with the new, aggregated content from the deep crawl. The RAG process is run a second time on this high-quality context to produce the final, accurate result.
-
-7. **Smart Caching**: The final result is only saved to the local cache if its confidence score is "High" or "Medium", ensuring that failed or low-quality runs don't prevent future attempts.
-
-## 📋 **Setup** Instructions
-
-### 1. **Install Dependencies**
-
-
+```cmd
 pip install -r requirements.txt
+crawl4ai-setup
+```
 
-Install browser dependencies for Crawl4ai
-playwright install
+`crawl4ai-setup` handles Playwright + Chromium; no manual `playwright install` needed.
 
+Create `.env` (never commit real values).
 
-### 2. **Create Environment File**
+---
 
-Create a `.env` file in the project root:
+## ▶️ Local Pipeline Run
 
-
-GOOGLE_API_KEY="your_google_api_key"
-PINECONE_API_KEY="your_pinecone_api_key"
-TAVILY_API_KEY="your_tavily_api_key"  # Recommended for enhanced search
-
-
-### 3. **Run the Application**
-
-
+If `main.py` supports args:
+```cmd
+python main.py --library tokio --ecosystem crates
+```
+Otherwise edit the target inside `main.py` and:
+```cmd
 python main.py
+```
 
+---
 
-## 🚧 **Development Roadmap**
+## 🔌 MCP (Local Stdio)
 
-### **Phase** 1: **Core Infrastructure & Intelligence** ✅ **COMPLETE**
+`.vscode/mcp.json` points to `mcp_stdio_server.py`.
 
-* \[x\] Multi-ecosystem documentation processing agent.
+Example (conceptual inside AI-enabled editor):
+```
+process_library: { "library_name": "tokio" }
+ask: { "library_name": "tokio", "question": "How do I create a TCP server?" }
+```
 
-* \[x\] Hybrid content extraction pipeline (Jina AI + Crawl4ai).
+---
 
-* \[x\] Always-fresh vector storage with Pinecone.
+## ☁️ Cloud HTTP Mode
 
-* \[x\] Intelligent, self-correcting RAG pipeline.
+Base: `${LIBRARIAN_CLOUD_URL}`
 
-* \[x\] **Deep crawl fallback** for low-confidence results.
+Endpoints:
+- `POST /process_library`
+	```json
+	{ "library_name": "tokio" }
+	```
+- `POST /ask`
+	```json
+	{ "library_name": "tokio", "question": "How to use async TCP?" }
+	```
 
-* \[x\] Smart caching system that avoids storing bad data.
+Python example:
+```python
+import os, requests
+BASE = os.environ["LIBRARIAN_CLOUD_URL"].rstrip("/")
 
-### **Phase 2: MCP Server Implementation** 🔄 **IN PROGRESS**
+r = requests.post(f"{BASE}/process_library", json={"library_name":"tokio"})
+print(r.json())
 
-* \[ \] Implement Model Context Protocol server interface using FastAPI.
+q = requests.post(f"{BASE}/ask", json={
+		"library_name":"tokio",
+		"question":"Show a minimal async TCP server example."
+})
+print(q.json())
+```
 
-* \[ \] Create a `/get_documentation` endpoint to run the full pipeline.
+(If adding auth later, include an `Authorization: Bearer <token>` header.)
 
-* \[ \] Create an `/ask` endpoint to perform RAG against the Pinecone index.
+---
 
-### **Phase 3: Editor Integration** 📋 **PLANNED**
+## 🔍 Troubleshooting
 
-* \[ \] VS Code extension development.
+| Symptom | Cause | Resolution |
+|---------|-------|-----------|
+| Very short summary | Thin initial page | Deep crawl auto-triggers; re-run if still low |
+| Crawl errors | Chromium missing | Re-run `crawl4ai-setup` |
+| Pinecone auth failure | Wrong key/region/index | Verify env values |
+| Repeated Low confidence | Poor URL selection | Refine heuristics / add denylist |
+| Slow first run | Chromium + warm start | Subsequent runs faster |
+| MCP stdio not spawning | Wrong Python path | Fix `.vscode/mcp.json` command |
 
-* \[ \] Neovim plugin integration.
+---
 
-* \[ \] Real-time package intelligence in the editor.
+## 🧩 Extending Ecosystems
 
-### **Phase 4: Advanced Features** 🎯 **FUTURE**
+1. New resolver (API call + candidate docs extraction)  
+2. Integrate into discovery ranking  
+3. Optional heuristics tuned per ecosystem  
+4. Reuse ingestion + fallback unchanged  
 
-* \[ \] Proactive dependency conflict prediction.
+---
 
-* \[ \] Community-driven documentation improvements.
+## 🔐 Security & Hygiene
+
+- Remove any real keys from history; rotate compromised keys.  
+- Ensure `.env` is in `.gitignore`.  
+- Plan authentication for public cloud endpoints.  
+- Avoid logging raw page content in production (use sampling).  
+
+---
+
+## 🚧 Roadmap (Condensed)
+
+| Horizon | Focus |
+|---------|-------|
+| Short | Solidify MCP surface, answer grounding |
+| Mid | VS Code & Neovim plugins, improved relevance scoring |
+| Long | Dependency conflict prediction, community doc quality signals |
+
+---
+
+## 📝 License
+
+None yet—add one (e.g., MIT or Apache-2.0) before external contributions.
+
+---
+
+## 🤝 Future Contributing Guidelines (Planned)
+
+- Include reproducible test run output for new ecosystems
+- Avoid committing secrets
+- Provide small fixture datasets for deterministic tests
+
+---
+
+## 📜 Example End-to-End (`tokio`)
+
+```
+process_library(tokio)
+ → discovery selects https://docs.rs/tokio
+ → jina scrape (enough?) if not → deep crawl
+ → vectors refreshed (Pinecone cosine 768D)
+ → structured summary (confidence: High)
+
+ask(tokio, "How do I spawn tasks?")
+ → retrieve top-k → Gemini synthesis with source context
+```
+
+---
+
+## ✅ Summary
+
+Librarian delivers a resilient, self-correcting documentation ingestion + RAG stack with dual local (MCP stdio) and cloud operation modes, leveraging Gemini + Jina + Crawl4ai + Pinecone to keep results fresh and high quality.
