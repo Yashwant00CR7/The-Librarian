@@ -73,18 +73,18 @@ Give me a library name (PyPI / npm / crates.io). I:
 ### Flow
 ```mermaid
 flowchart LR
-		A[Client (MCP / Cloud)] --> B[Request Handler]
-		B --> C[Library Resolver\n(PyPI / npm / Crates)]
-		C --> D[URL Discovery Agent\nGemini + DuckDuckGo + Tavily]
-		D --> E[Jina Fast Scrape]
-		E --> F{Confidence High?}
-		F -- Yes --> H[Chunk & Embed]
-		F -- No --> G[Deep Crawl\nCrawl4ai]
-		G --> H[Chunk & Embed]
-		H --> I[Pinecone Refresh\n(delete+upsert)]
-		I --> J[RAG + Structuring]
-		J --> K[Cache (if Medium/High)]
-		K --> L[Response]
+    A["Client (MCP / Cloud)"] --> B["Request Handler"]
+    B --> C["Library Resolver<br/>(PyPI / npm / Crates)"]
+    C --> D["URL Discovery Agent<br/>Gemini + DuckDuckGo + Tavily"]
+    D --> E["Jina Fast Scrape"]
+    E --> F{"Confidence High?"}
+    F -- "Yes" --> H["Chunk & Embed"]
+    F -- "No" --> G["Deep Crawl<br/>Crawl4ai"]
+    G --> H
+    H --> I["Pinecone Refresh<br/>(delete+upsert)"]
+    I --> J["RAG + Structuring"]
+    J --> K["Cache (if Medium/High)"]
+    K --> L["Response"]
 ```
 
 ### Sequence (Ask)
